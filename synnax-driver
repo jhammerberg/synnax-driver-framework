@@ -1,0 +1,180 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "synnax"
+# ]
+# ///
+
+print("Initializing...")
+
+import time
+import synnax as sy
+import argparse
+
+client = sy.Synnax()
+
+""" Start example sensors & commands"""
+
+def get_cpu_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            temp_raw = f.read().strip()
+            if temp_raw is not None:
+                return float(temp_raw) / 1000.0
+            else:
+                return float(-1.0)
+    except FileNotFoundError:
+        return float(-1.0)
+
+def get_gpu_temp():
+    return get_cpu_temp() + 5.0 # Placeholder for GPU temperature logic
+
+vlv1_state = 0
+def set_valve_state(cmd):
+    global vlv1_state
+    if cmd != vlv1_state:
+        vlv1_state = cmd
+        print(f"Valve state set to: {vlv1_state}")
+    return vlv1_state
+
+channels = {
+    "sensors": {
+        "cpu_temp": get_cpu_temp,
+        "gpu_temp": get_gpu_temp,
+    },
+    "command": {
+        "vlv1": set_valve_state,
+    }
+}
+
+""" End example sensors & commands"""
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="CPU Temperature Logger")
+    parser.add_argument("-r", "--rate", type=int, default=20, help="Sampling rate in Hz")
+    parser.add_argument("-l", "--log", type=bool, default=False, help="Enable logging")
+    return parser.parse_args()
+
+def main():
+    global channels
+    args = parse_args()
+    setup_channels(channels)
+    print("Initialization complete, driver started.")
+    driver(args, channels)
+
+def setup_channels(channels):
+    sensor_time_created = False
+    cmd_time_created = False
+    for group_type, group in channels.items():
+        for device_name, device_func in group.items():
+            if group_type == "sensors" and not sensor_time_created:
+                client.channels.create(
+                    name="sensor_time",
+                    is_index=True,
+                    data_type=sy.DataType.TIMESTAMP,
+                    retrieve_if_name_exists=True,
+                )
+                sensor_time_created = True
+            if group_type == "command" and not cmd_time_created:
+                client.channels.create(
+                    name="cmd_time",
+                    is_index=True,
+                    data_type=sy.DataType.TIMESTAMP,
+                    retrieve_if_name_exists=True,
+                )
+                cmd_time_created = True
+            if group_type == "sensors":
+                create_sensor_channel(device_name, device_func)
+            if group_type == "command":
+                create_command_channel(device_name, device_func)
+
+def create_sensor_channel(sensor_name, sensor_func):
+    if sensor_func is not None:
+        client.channels.create(
+            data_type=sy.DataType.FLOAT32,
+            index=client.channels.retrieve("sensor_time").key,
+            name=sensor_name,
+            retrieve_if_name_exists=True,
+        )
+        print(f"Sensor channel '{sensor_name}' created.")
+    else:
+        print(f"No function found for sensor '{sensor_name}'.")
+
+def create_command_channel(command_name, command_func):
+    if command_func is not None:
+        client.channels.create(
+            data_type="uint8",
+            name=command_name+"_cmd",
+            virtual=True,
+            retrieve_if_name_exists=True,
+        )
+
+        print(f"Channel '{command_name}_cmd' created.")
+        
+        client.channels.create(
+            data_type="uint8",
+            index=client.channels.retrieve("cmd_time").key,
+            name=command_name+"_state",
+            retrieve_if_name_exists=True,
+        )
+        
+        print(f"Channel '{command_name}_state' created.")
+    else:
+        print(f"No function found for command '{command_name}'.")
+
+def driver(args, channels):
+    write_to_sensors = ["sensor_time"]
+    write_to_commands = ["cmd_time"]
+    read_from = []
+    for group in channels:
+        if group == "sensors":
+            for channel in channels[group]:
+                write_to_sensors.append(channel)
+        elif group == "command":
+            for channel in channels[group]:
+                write_to_commands.append(channel + "_state")
+                read_from.append(channel + "_cmd")                
+
+    with client.open_streamer(read_from) as streamer:
+        with client.open_writer(
+            start=sy.TimeStamp.now(),
+            channels=write_to_sensors + write_to_commands,
+            enable_auto_commit=True,
+        ) as writer:
+            
+            while True:
+                timestamp_sensor = sy.TimeStamp.now()
+                timestamp_cmd = sy.TimeStamp.now()
+                frame = streamer.read(timeout=0)
+                
+                if frame is not None:
+                    for frame_channel in frame.channels:
+                        if frame_channel.endswith("_cmd"):
+                            command_name = frame_channel[:-4]
+                            if command_name in channels["command"]:
+                                cmd_func = channels["command"][command_name]
+                                cmd_value = frame[frame_channel][0] if len(frame[frame_channel]) > 0 else None
+                                if cmd_value is not None:
+                                    result = cmd_func(bool(cmd_value))
+                                    writer.write({
+                                            "cmd_time": timestamp_cmd,
+                                            command_name + "_state": int(result),
+                                    })
+                                    if args.log:
+                                        print(f"Executed '{command_name}' with value {cmd_value}, result: {result}")
+
+                sensor_data = {"sensor_time": timestamp_sensor}
+                for sensor in channels["sensors"]:
+                    sensor_func = channels["sensors"][sensor]
+                    if sensor_func is not None:
+                        sensor_value = sensor_func()
+                        sensor_data[sensor] = sensor_value
+                        if args.log:
+                            print(f"Sensor '{sensor}': {sensor_value}")
+                writer.write(sensor_data)
+
+                time.sleep(args.rate ** -1)
+
+if __name__ == "__main__":
+    main()
